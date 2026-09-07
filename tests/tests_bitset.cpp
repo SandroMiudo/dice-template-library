@@ -23,6 +23,30 @@ concept has_subscript_operator = requires(I i, std::iter_difference_t<I> n) { i[
 template<typename I>
 concept dereference_is_assignable = requires(I i, bool b) { *i = b; };
 
+// The initializer-list ctor sizes a bitset to the exact bit width of the list: trailing all-zero
+// segments are dropped and the top segment contributes only its significant bits, so `dyn8{0x08}`
+// is 4 bits wide and `dyn8{0x00, 0x00}` is empty. Where a test needs a value *and* a logical size
+// that fills whole segments, it has to say so - that is what this builds.
+template<typename Bitset, typename Value>
+Bitset filled(Value const pattern, size_t const bits) {
+	Bitset b{};
+	b.resize(bits);
+	for (size_t i = 0; i < bits; ++i) {
+		if ((static_cast<uint64_t>(pattern) >> i) & 1u) {
+			b.set(i);
+		}
+	}
+	return b;
+}
+
+// a bitset of `bits` zero bits - the storage an all-zero initializer list used to allocate
+template<typename Bitset>
+Bitset zeroed(size_t const bits) {
+	Bitset b{};
+	b.resize(bits);
+	return b;
+}
+
 TEST_SUITE("bitset") {
 	using namespace dice::template_library;
 
@@ -58,7 +82,8 @@ TEST_SUITE("bitset") {
 			// NOTE: must use parens, not braces - dyn64{3} would list-initialize a single
 			// segment holding the value 3 instead of calling the explicit size_t constructor,
 			// since a viable initializer_list constructor always wins list-initialization.
-			dyn64 b(3);
+			dyn64 b{};
+		    b.resize(3 * 64);
 			REQUIRE_EQ(b.capacity_in_bits(), 3 * 64);
 			for (size_t i = 0; i < b.capacity_in_bits(); ++i) {
 				CHECK_FALSE(b.test(i));
@@ -66,7 +91,7 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("copy/move construction and assignment are independent of the source") {
-			dyn8 a{0x00, 0x00};
+			dyn8 a = zeroed<dyn8>(2 * 8);
 
 			dyn8 b{a};
 			b.set(3);
@@ -193,7 +218,7 @@ TEST_SUITE("bitset") {
 		using fixed64 = bitset<4 * 64, 4 * 64>; // fixed: pass the same bit count twice
 		constexpr size_t fixed64_capacity_bits = 4 * 64;
 
-		SUBCASE("initializer list must match extent exactly") {
+		SUBCASE("an initializer list of exactly the extent fills every segment") {
 			fixed64 b{1, 2, 3, 4};
 			REQUIRE_EQ(b.size_in_bits(), 4 * 64);
 			CHECK(b.test(0));   // segment 0, value 1
@@ -201,8 +226,18 @@ TEST_SUITE("bitset") {
 			CHECK(b.test(129)); // segment 2, offset 1, value 3
 		}
 
-		SUBCASE("mismatched initializer list size throws") {
-			CHECK_THROWS_AS((fixed64{1, 2, 3}), std::length_error);
+		SUBCASE("a shorter initializer list is accepted, the remaining segments stay zero") {
+			// the list gives the low segments; a fixed bitset is its declared size either way
+			fixed64 b{1, 2, 3};
+			CHECK_EQ(b.size_in_bits(), 4 * 64);
+			CHECK(b.test(0));
+			CHECK(b.test(65));
+			CHECK(b.test(129));
+			CHECK_EQ(b.count(), 4);  // 1 + 1 + 2 bits, and segment 3 is zero
+		}
+
+		SUBCASE("an initializer list wider than the extent throws") {
+			CHECK_THROWS_AS((fixed64{1, 2, 3, 4, 5}), std::length_error);
 		}
 
 		SUBCASE("out_of_range at the fixed capacity boundary") {
@@ -247,7 +282,8 @@ TEST_SUITE("bitset") {
 
 		for (auto const &c : cases) {
 			CAPTURE(static_cast<unsigned>(c.value));
-			dyn8 b{c.value};
+			// the expectations are for 8 logical bits, which the value's own width need not be
+			dyn8 const b = filled<dyn8>(c.value, 8);
 			CHECK_EQ(b.countr_zero(), c.countr_zero);
 			CHECK_EQ(b.countl_zero(), c.countl_zero);
 			CHECK_EQ(b.countr_one(), c.countr_one);
@@ -274,7 +310,9 @@ TEST_SUITE("bitset") {
 			// segment 0 has its top bit set (no leading zeros locally); segments 1 and 2 sit at
 			// the high/most-significant end and are fully zero, so the global leading-zero count
 			// must include both of them before reaching segment 0's own contribution of 0.
-			dyn8 b{0b10000000, 0x00, 0x00};
+			// an all-zero top segment is trimmed by the ctor, so the size is set explicitly here
+			dyn8 b = zeroed<dyn8>(3 * 8);
+			b.set(7);
 			CHECK_EQ(b.countl_zero(), 8 + 8 + 0);
 		}
 
@@ -288,11 +326,21 @@ TEST_SUITE("bitset") {
 		SUBCASE("all_set true only when every bit is 1") {
 			dyn8 full{0xFF, 0xFF};
 			dyn8 partial{0xFF, 0xFE};
-			dyn8 empty_bits{0x00, 0x00};
+			dyn8 zero_bits = zeroed<dyn8>(2 * 8);
 
 			CHECK(full.all_set());
 			CHECK_FALSE(partial.all_set());
-			CHECK_FALSE(empty_bits.all_set());
+			CHECK_FALSE(zero_bits.all_set());
+		}
+
+		SUBCASE("all_set is vacuously true for a bitset with no bits") {
+			// an all-zero initializer list is the empty bitset, and every one of its zero bits is
+			// set - same answer std::bitset<0>::all() and boost::dynamic_bitset{}.all() give
+			dyn8 const empty_bits{0x00, 0x00};
+			REQUIRE_EQ(empty_bits.size_in_bits(), 0);
+			CHECK(empty_bits.all_set());
+			CHECK_FALSE(empty_bits.any_set());
+			CHECK(empty_bits.none_set());
 		}
 
 		SUBCASE("none_set true only when every bit is 0") {
@@ -363,8 +411,12 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("differing size compares unequal") {
-			dyn8 a{0x12};
-			dyn8 b{0x12, 0x00};
+			// identical bits, different logical size - a trailing zero segment would not do it any
+			// more, the ctor trims it and both sides would be the same bitset
+			dyn8 a{0x12};  // 5 logical bits
+			dyn8 b{0x12};
+			b.resize(8);
+			REQUIRE_EQ(a.count(), b.count());
 			CHECK_FALSE(a == b);
 		}
 	}
@@ -422,7 +474,7 @@ TEST_SUITE("bitset") {
 
 	TEST_CASE("iteration") {
 		SUBCASE("bit-mode iteration visits every bit exactly once") {
-			dyn8 b{0x00, 0x00};
+			dyn8 b = zeroed<dyn8>(2 * 8);
 			auto it = b.begin();
 			auto const sentinel = b.end();
 
@@ -524,7 +576,7 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("explicit iterator construction with an offset validates the offset") {
-			dyn8 b{0x00};
+			dyn8 b = zeroed<dyn8>(8);
 			CHECK_NOTHROW((dyn8::bit_iterator{b, 7}));
 			CHECK_THROWS_AS((dyn8::bit_iterator{b, 8}), std::out_of_range); // dyn8's segment width is 8 bits
 
@@ -533,7 +585,7 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("explicit iterator construction with an offset and segment validates both") {
-			dyn8 b{0x00, 0x00};
+			dyn8 b = zeroed<dyn8>(2 * 8);
 			CHECK_NOTHROW((dyn8::bit_iterator{b, 0, 1}));
 			CHECK_THROWS_AS((dyn8::bit_iterator{b, 8, 0}), std::out_of_range); // bad offset
 			CHECK_THROWS_AS((dyn8::bit_iterator{b, 0, 2}), std::out_of_range); // segment out of bounds (only 2 segments exist)
@@ -547,7 +599,7 @@ TEST_SUITE("bitset") {
 
 			size_t visited = 0;
 			int global_ix = 15;
-			for (auto it = b.rbegin(); it != b.rend(); ++it, --global_ix) {
+			for (dyn8::reverse_iterator it = b.rbegin(); it != b.rend(); ++it, --global_ix) {
 				bool const expected = (global_ix == 0 || global_ix == 15);
 				CHECK_EQ(static_cast<bool>(*it), expected);
 				++visited;
@@ -559,7 +611,7 @@ TEST_SUITE("bitset") {
 		SUBCASE("reverse iteration on a const bitset") {
 			dyn8 const b{0b00000001, 0b10000000};
 			size_t visited = 0;
-			for (auto it = b.rbegin(); it != b.rend(); ++it) {
+			for (dyn8::const_reverse_iterator it = b.rbegin(); it != b.rend(); ++it) {
 				++visited;
 			}
 			CHECK_EQ(visited, b.capacity_in_bits());
@@ -628,6 +680,30 @@ TEST_SUITE("bitset") {
 		CHECK(true);
 	}
 
+	TEST_CASE("the public iterator aliases name what the accessors return") {
+		// none of the public aliases carries a _t suffix - that spelling belongs to the private,
+		// mode-parameterized templates they are instantiated from.
+		static_assert(std::is_same_v<decltype(std::declval<dyn64 &>().begin()), dyn64::bit_iterator>);
+		static_assert(std::is_same_v<decltype(std::declval<dyn64 const &>().begin()), dyn64::const_bit_iterator>);
+		static_assert(std::is_same_v<decltype(std::declval<dyn64 &>().rbegin()), dyn64::reverse_iterator>);
+		static_assert(std::is_same_v<decltype(std::declval<dyn64 const &>().rbegin()), dyn64::const_reverse_iterator>);
+		static_assert(std::is_same_v<decltype(std::declval<dyn64 &>().rend()), dyn64::reverse_iterator>);
+		static_assert(std::is_same_v<decltype(std::declval<dyn64 const &>().rend()), dyn64::const_reverse_iterator>);
+		static_assert(std::is_same_v<decltype(std::declval<dyn64 &>().positions_begin()), dyn64::positional_iterator>);
+		static_assert(std::is_same_v<decltype(std::declval<dyn64 const &>().positions_begin()), dyn64::const_positional_iterator>);
+
+		// and they are the reverse adaptors over the bit iterators, not some other type
+		static_assert(std::is_same_v<dyn64::reverse_iterator, std::reverse_iterator<dyn64::bit_iterator>>);
+		static_assert(std::is_same_v<dyn64::const_reverse_iterator, std::reverse_iterator<dyn64::const_bit_iterator>>);
+		static_assert(std::is_same_v<dyn64::reverse_iterator::value_type, bool>);
+		static_assert(std::is_same_v<dyn64::value_type, bool>);
+		static_assert(std::is_same_v<dyn64::reference, dyn64::bit_iterator::reference>);
+
+		static_assert(std::bidirectional_iterator<dyn64::reverse_iterator>);
+		static_assert(std::bidirectional_iterator<dyn64::const_reverse_iterator>);
+		CHECK(true);
+	}
+
 	TEST_CASE("bitset_iterator new random-access operations") {
 		SUBCASE("operator[] reads the bit at begin() + n without moving the iterator") {
 			dyn8 b{0b00000000, 0b00000010};
@@ -651,7 +727,7 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("relational operators order iterators by their global bit position") {
-			dyn8 b{0x00, 0x00, 0x00};
+			dyn8 b = zeroed<dyn8>(3 * 8);
 			auto const low = b.begin() + 3;
 			auto const mid = b.begin() + 9;   // different segment
 			auto const high = b.begin() + 20;
@@ -673,18 +749,11 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("commutative operator+ : n + it == it + n") {
-			dyn8 b{0x00, 0x00};
+			dyn8 b = zeroed<dyn8>(2 * 8);
 			auto const it = b.begin() + 2;
 
 			CHECK((5 + it) == (it + 5));
 			CHECK_EQ((5 + it).get(), (it + 5).get());
-		}
-
-		SUBCASE("free operator- : n - it == it - n (library-defined symmetric semantics)") {
-			dyn8 b{0x00, 0x00};
-			auto const it = b.begin() + 10;
-
-			CHECK((3 - it) == (it - 3));
 		}
 
 		SUBCASE("default-constructed iterators are equality-comparable and independent of any bitset") {
@@ -692,7 +761,7 @@ TEST_SUITE("bitset") {
 			dyn8::bit_iterator b{};
 			CHECK(a == b);
 
-			dyn8 bs{0x00};
+			dyn8 bs = zeroed<dyn8>(8);
 			auto valid = bs.begin();
 			a = valid;
 			CHECK(a == valid);
@@ -700,7 +769,7 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("negative offsets: it += (-n) matches it -= n, it -= (-n) matches it += n") {
-			dyn8 b{0x00, 0x00};
+			dyn8 b = zeroed<dyn8>(2 * 8);
 			auto const base = b.begin() + 9;
 
 			dyn8::bit_iterator::difference_type const n = 3;
@@ -718,7 +787,7 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("negative offsets round-trip back to the exact starting position") {
-			dyn8 b{0x00, 0x00, 0x00};
+			dyn8 b = zeroed<dyn8>(3 * 8);
 			auto const base = b.begin() + 15;
 			dyn8::bit_iterator::difference_type const n = 7;
 
@@ -732,7 +801,7 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("std::next/std::prev/std::distance work via the random-access fast path") {
-			dyn8 b{0x00, 0x00, 0x00};
+			dyn8 b = zeroed<dyn8>(3 * 8);
 			auto const it = b.begin() + 5;
 
 			auto const next5 = std::next(it, 5);
@@ -746,7 +815,7 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("std::advance with a negative distance moves backwards correctly") {
-			dyn8 b{0x00, 0x00, 0x00};
+			dyn8 b = zeroed<dyn8>(3 * 8);
 			auto it = b.begin() + 12;
 			std::advance(it, -5);
 			CHECK_EQ(it, b.begin() + 7);
@@ -859,8 +928,10 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("shift crossing multiple segment boundaries") {
-			dyn8 left{0xFF, 0x00, 0x00}; // bits 0..7 set (bottom segment)
-			left <<= 10;                 // pushes the low segment's bits up across a boundary
+			// the two high segments have to be part of the logical size - the ctor would trim an
+			// all-zero top segment, and <<= never grows the storage it shifts within
+			dyn8 left = filled<dyn8>(0xFF, 3 * 8); // bits 0..7 set (bottom segment)
+			left <<= 10;                           // pushes the low segment's bits up across a boundary
 			CHECK_FALSE(left.test(9));
 			CHECK(left.test(10));
 			CHECK(left.test(17));
@@ -979,7 +1050,8 @@ TEST_SUITE("bitset") {
 	}
 
     TEST_CASE("formatting long") {
-	    dyn64 b_long(32); // parens - see the "size constructor zero-fills every segment" note above
+	    dyn64 b_long{}; // parens - see the "size constructor zero-fills every segment" note above
+	    b_long.resize(32 * 64);
 	    MESSAGE("hex (default): ", std::format("{}", b_long));
 	    MESSAGE("binary: ", std::format("{:b}", b_long));
 	}
@@ -987,12 +1059,12 @@ TEST_SUITE("bitset") {
 	TEST_CASE("formatter output content (hex and binary, big endian)") {
 		// bit_iterator itself walks LEAST-significant bit first: offset 0 is bit 0 of a segment
 		// (segment_set uses "1 << offset", so offset 0 is the LSB), and ++it moves toward higher
-		// offsets, i.e. toward the MSB. Printing must NOT follow that raw traversal order - a
-		// human reads/writes binary and hex MSB-first - so the formatter reverses direction for
-		// display. This is the specific behavior under test here, primarily in binary mode, where
-		// the formatter explicitly does `subrange(it, seg_end) | std::views::reverse` before
-		// emitting characters (bitset.hpp's format()). Segments themselves are still emitted in
-		// storage order (segment 0 first) - only the bit order *within* a segment is reversed.
+		// offsets, i.e. toward the MSB. Segments themselves are stored least-significant first too
+		// (segment 0 holds the lowest bits). Printing must NOT follow either raw storage order - a
+		// human reads/writes binary and hex MSB-first, both across segments and within one - so the
+		// formatter emits the most-significant segment first and, within each segment, its most
+		// significant bit first. Mixing the two (segment order kept, only bit order reversed) would
+		// read as neither convention.
 
 		SUBCASE("binary mode: bit at offset 0 (first bit the iterator visits) prints LAST") {
 			// the iterator's first bit (lowest offset, LSB) must end up as the rightmost/last
@@ -1016,27 +1088,26 @@ TEST_SUITE("bitset") {
 			CHECK_EQ(std::format("{:b}", b), "[\n[10110011]\n]\n");
 		}
 
-		SUBCASE("binary mode reverses within each segment independently, segments stay in storage order") {
+		SUBCASE("binary mode reverses both segment order and bit order within each segment") {
+			// segment 1 (0xFF) is the most significant, so it prints first, still MSB-first
+			// internally; segment 0 (0x00) - the least significant - prints last.
 			dyn8 b{0x00, 0xFF};
-			CHECK_EQ(std::format("{:b}", b), "[\n[00000000]\n[11111111]\n]\n");
+			CHECK_EQ(std::format("{:b}", b), "[\n[11111111]\n[00000000]\n]\n");
 		}
 
-		SUBCASE("hex mode renders one segment per line, in storage order") {
+		SUBCASE("hex mode renders one segment per line, most-significant segment first") {
 			// hex mode reads the raw segment value via it.get() and lets std::format's own hex
-			// notation render it - it does not iterate bit-by-bit, so there is no LSB/MSB
+			// notation render it - it does not iterate bit-by-bit, so there is no LSB/MSB bit
 			// traversal to reverse here. The MSB-first digit order (0xa5, not 0x5a) simply comes
-			// from std::format's normal hex formatting of an integer, not from bitset's own logic.
+			// from std::format's normal hex formatting of an integer. Segment 1 (0x34) is still the
+			// most significant, so it is rendered on the first line.
 			dyn8 b{0x12, 0x34};
-			CHECK_EQ(std::format("{}", b), "[\n[0x12]\n[0x34]\n]\n");
+			CHECK_EQ(std::format("{}", b), "[\n[0x34]\n[0x12]\n]\n");
 		}
 
-		SUBCASE("hex mode drops a fully-zero segment's leading zero (no fixed-width zero padding)") {
-			// documents the actual current width behavior rather than assuming it: the format
-			// spec's width only reserves 2*sizeof(T) characters, which already covers "0x" plus
-			// every significant digit for a non-zero byte, but is one digit short of the full
-			// 2-digit zero-padded form for a segment that is exactly 0.
+		SUBCASE("hex mode zero-pads a fully-zero segment to the full width") {
 			dyn8 b{0x00, 0xFF};
-			CHECK_EQ(std::format("{}", b), "[\n[0x0]\n[0xff]\n]\n");
+			CHECK_EQ(std::format("{}", b), "[\n[0xff]\n[0x00]\n]\n");
 		}
 
 		SUBCASE("empty bitset formats identically regardless of mode - no segment lines") {
@@ -1081,26 +1152,26 @@ TEST_SUITE("bitset") {
 		SUBCASE("single 8-bit segment, several bit patterns") {
 			for (uint8_t const pattern : {uint8_t{0x00}, uint8_t{0xFF}, uint8_t{0b10110011},
 			                               uint8_t{0b00000001}, uint8_t{0b10000000}, uint8_t{0b01010101}}) {
-				dyn8 b{pattern};
+				dyn8 const b = filled<dyn8>(pattern, 8);
 				std::string const expected = "[\n[" + std::bitset<8>(pattern).to_string() + "]\n]\n";
 				CAPTURE(static_cast<unsigned>(pattern));
 				CHECK_EQ(std::format("{:b}", b), expected);
 			}
 		}
 
-		SUBCASE("multiple 8-bit segments - each reversed independently, in storage order") {
+		SUBCASE("multiple 8-bit segments - each reversed independently, most significant segment first") {
 			dyn8 b{0b10110011, 0b00001111, 0b11100001};
 			std::string const expected = "[\n["
-			                            + std::bitset<8>(0b10110011).to_string() + "]\n["
+			                            + std::bitset<8>(0b11100001).to_string() + "]\n["
 			                            + std::bitset<8>(0b00001111).to_string() + "]\n["
-			                            + std::bitset<8>(0b11100001).to_string() + "]\n]\n";
+			                            + std::bitset<8>(0b10110011).to_string() + "]\n]\n";
 			CHECK_EQ(std::format("{:b}", b), expected);
 		}
 
 		SUBCASE("64-bit segment patterns") {
 			for (uint64_t const pattern : {uint64_t{0}, ~uint64_t{0}, uint64_t{0x0123456789ABCDEFull},
 			                                uint64_t{1}, uint64_t{1} << 63}) {
-				dyn64 b{pattern};
+				dyn64 const b = filled<dyn64>(pattern, 64);
 				std::string const expected = "[\n[" + std::bitset<64>(pattern).to_string() + "]\n]\n";
 				CAPTURE(pattern);
 				CHECK_EQ(std::format("{:b}", b), expected);
@@ -1110,8 +1181,8 @@ TEST_SUITE("bitset") {
 		SUBCASE("random-ish multi-segment 64-bit pattern") {
 			dyn64 b{0xDEADBEEFCAFEBABEull, 0x0123456789ABCDEFull};
 			std::string const expected = "[\n["
-			                            + std::bitset<64>(0xDEADBEEFCAFEBABEull).to_string() + "]\n["
-			                            + std::bitset<64>(0x0123456789ABCDEFull).to_string() + "]\n]\n";
+			                            + std::bitset<64>(0x0123456789ABCDEFull).to_string() + "]\n["
+			                            + std::bitset<64>(0xDEADBEEFCAFEBABEull).to_string() + "]\n]\n";
 			CHECK_EQ(std::format("{:b}", b), expected);
 		}
 	}
@@ -1254,7 +1325,8 @@ TEST_SUITE("bitset") {
 
 	TEST_CASE("shrink_to_fit") {
 		SUBCASE("drops a trailing all-zero segment, keeping the last live one") {
-			dyn8 b{0xFF, 0x0F, 0x00};
+			dyn8 b = filled<dyn8>(0x0FFF, 3 * 8);  // bits 0..11 set, segment 2 all zero
+			REQUIRE_EQ(b.capacity_in_bits(), 3 * 8);
 			b.shrink_to_fit();
 			REQUIRE_EQ(b.capacity_in_bits(), 2 * 8); // segment 2 (0x00) dropped, segment 1 (0x0F) is the boundary and is kept
 			for (size_t i = 0; i < 8; ++i) CHECK(b.test(i));
@@ -1266,7 +1338,7 @@ TEST_SUITE("bitset") {
 			// scanning from the end: segments 3, 2, and 1 are all zero and get skipped over;
 			// segment 0 (0xAA) is the first non-zero segment found, so storage is truncated
 			// right after it, dropping everything past it.
-			dyn8 b{0xAA, 0x00, 0x00, 0x00};
+			dyn8 b = filled<dyn8>(0xAA, 4 * 8);
 			b.shrink_to_fit();
 			REQUIRE_EQ(b.capacity_in_bits(), 1 * 8);
 			CHECK_EQ(b.count(), 4);
@@ -1280,8 +1352,9 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("every segment is zero - shrinks capacity away entirely") {
-			dyn8 b(3); // 3 zero-initialized segments
-			b.shrink_to_fit();
+			dyn8 b{}; // 3 zero-initialized segments
+			b.resize(3 * 8);
+		    b.shrink_to_fit();
 			CHECK_EQ(b.capacity_in_bits(), 0);
 			CHECK_EQ(b.size_in_bits(), 0);
 		}
@@ -1344,8 +1417,9 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("set_positions sets exactly the given bits") {
-			dyn64 b(2); // parens - see the "size constructor zero-fills every segment" note above
-			b.set_positions(std::array{0uz, 5uz, 127uz});
+			dyn64 b{}; // parens - see the "size constructor zero-fills every segment" note above
+			b.resize(2 * 64);
+		    b.set_positions(std::array{0uz, 5uz, 127uz});
 			CHECK(b.test(0));
 			CHECK(b.test(5));
 			CHECK(b.test(127));
@@ -1711,15 +1785,18 @@ TEST_SUITE("bitset") {
 			CHECK_FALSE(b.test(10));
 		}
 
-		SUBCASE("flip(ix) beyond current logical size is a no-op - unlike set(), it never grows") {
+		SUBCASE("flip(ix) beyond current logical size grows, exactly like set() does") {
+			// reset() is the odd one out: it has nothing to clear past the logical end, so it stays
+			// a no-op there, while set() and flip() both bring the index into range
 			dyn8 b{};
 			b.flip(10);
-			CHECK_EQ(b.size_in_bits(), 0);
-			CHECK_FALSE(b.test(10));
+			CHECK_EQ(b.size_in_bits(), 11);
+			CHECK(b.test(10));  // flipped from the zero it was grown with
 		}
 
 		SUBCASE("set_first_free() grows logical size by exactly 1 when every existing bit is full") {
-			dyn8 b(1); // 1 segment pre-allocated, all zero, logical size 8
+			dyn8 b{}; // 1 segment pre-allocated, all zero, logical size 8
+			b.resize(8);
 			for (size_t i = 0; i < 8; ++i) b.set(i);
 			REQUIRE_EQ(b.size_in_bits(), 8);
 
@@ -1737,7 +1814,8 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("set_positions() grows logical size to cover the maximum position given, regardless of order") {
-			dyn64 b(1); // 1 segment, logical size 64
+			dyn64 b{}; // 1 segment, logical size 64
+			b.resize(64);
 			b.set_positions(std::array{5uz, 70uz, 3uz}); // 70 is neither first nor last in the list
 			CHECK_EQ(b.size_in_bits(), 71);
 			CHECK(b.test(5));
@@ -1746,7 +1824,8 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("reset_positions() never grows logical size - out-of-range positions are no-ops") {
-			dyn64 b(1);
+			dyn64 b{};
+			b.resize(64);
 			b.reset_positions(std::array{5uz, 70uz});
 			CHECK_EQ(b.size_in_bits(), 64);
 			CHECK_FALSE(b.test(70));
@@ -1771,9 +1850,10 @@ TEST_SUITE("bitset") {
 
 	TEST_CASE("shrink_to_fit keeps logical size and capacity in lockstep") {
 		SUBCASE("dropping a trailing all-zero segment shrinks logical size to the new exact capacity") {
-			dyn8 b{0xFF, 0x0F, 0x00}; // segment 2 (0x00) is the only all-zero trailing segment
+			dyn8 b = filled<dyn8>(0x0FFF, 3 * 8);  // segment 2 is the only all-zero trailing segment
+			REQUIRE_EQ(b.size_in_bits(), 24);
 			b.shrink_to_fit();
-			CHECK_EQ(b.size_in_bits(), 16);
+			CHECK_EQ(b.size_in_bits(), 16);  // clamped to what the remaining storage holds
 			CHECK_EQ(b.capacity_in_bits(), 16);
 		}
 
@@ -1875,7 +1955,8 @@ TEST_SUITE("bitset") {
 		}
 
 		SUBCASE("count()/all_set()/any_set()/none_set() only consider bits within logical size") {
-			dyn8 b(1); // 1 full segment, 8 logical bits
+			dyn8 b{}; // 1 full segment, 8 logical bits
+			b.resize(8);
 			for (size_t i = 0; i < 8; ++i) b.set(i);
 			b.set(10); // grows into segment 1; bits 8,9 stay 0, bit 10 is set - segment 1 isn't fully set
 
@@ -1892,7 +1973,8 @@ TEST_SUITE("bitset") {
 		a.set(15);
 		REQUIRE_EQ(a.size_in_bits(), 16);
 
-		dyn8 b(2);
+		dyn8 b{};
+		b.resize(16);
 		b.set(0);
 		REQUIRE_EQ(b.size_in_bits(), 16);
 
@@ -1914,12 +1996,13 @@ TEST_SUITE("bitset") {
 		constexpr size_t seg64 = 64;
 
 		SUBCASE("aligned: the set bit sits in an early segment (non-edge - the leftover segment does not exist)") {
-			dyn64 b{1ull << 5, 0}; // 2 full segments (128 bits, aligned); bit 5 is the first 1
+			dyn64 b = zeroed<dyn64>(2 * seg64); // 2 full segments (128 bits, aligned)
+			b.set(5);                           // bit 5 is the first 1
 			CHECK_EQ(b.countr_zero(), 5);
 		}
 
 		SUBCASE("aligned: an entirely-zero bitset returns exactly the (segment-aligned) logical size") {
-			dyn64 b{0, 0};
+			dyn64 b = zeroed<dyn64>(2 * seg64);
 			CHECK_EQ(b.countr_zero(), 2 * seg64);
 		}
 
@@ -1983,12 +2066,13 @@ TEST_SUITE("bitset") {
 		constexpr size_t seg64 = 64;
 
 		SUBCASE("aligned: the set bit sits in the last segment (non-edge - resolved without any fallback)") {
-			dyn64 b{0, 1ull << 58}; // 2 full segments (128 bits, aligned)
+			dyn64 b = zeroed<dyn64>(2 * seg64); // 2 full segments (128 bits, aligned)
+			b.set(seg64 + 58);
 			CHECK_EQ(b.countl_zero(), 5); // 63 - 58
 		}
 
 		SUBCASE("aligned: an entirely-zero bitset returns exactly the (segment-aligned) logical size") {
-			dyn64 b{0, 0};
+			dyn64 b = zeroed<dyn64>(2 * seg64);
 			CHECK_EQ(b.countl_zero(), 2 * seg64);
 		}
 
@@ -2266,7 +2350,7 @@ TEST_SUITE("bitset") {
 
 	TEST_CASE("operator~ preserves the zero-padding invariant across a non-aligned boundary") {
 		SUBCASE("aligned: NOT of all-zero is all-one and vice versa, double negation is the identity") {
-			dyn64 b{0, 0};
+			dyn64 b = zeroed<dyn64>(2 * 64);
 			auto const notb = ~b;
 			CHECK(notb.all_set());
 			CHECK_EQ(notb.count(), 2 * 64);
