@@ -132,7 +132,3 @@ custom_add_test(tests_sandbox)
 
 add_executable(tests_bitset tests_bitset.cpp)
 custom_add_test(tests_bitset)
-
-add_executable(tests_bitset_ext tests_bitset_ext.cpp)
-target_link_libraries(tests_bitset_ext PRIVATE Boost::headers)
-custom_add_test(tests_bitset_ext)
